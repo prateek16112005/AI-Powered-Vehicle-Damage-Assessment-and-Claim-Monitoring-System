@@ -1,7 +1,8 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-import os
+from ultralytics import YOLO
 import shutil
+import os
 
 app = FastAPI()
 
@@ -13,13 +14,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-def home():
-    return {"message": "Backend running"}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+# Load model (pretrained for now)
+model = YOLO("yolov8n.pt")   # auto downloads
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
@@ -28,14 +24,43 @@ async def predict(file: UploadFile = File(...)):
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    file_size = os.path.getsize(temp_path)
+    # Run YOLO inference
+    results = model(temp_path)
+
+    damages = []
+    confidences = []
+
+    for r in results:
+        if r.boxes is not None:
+            for box in r.boxes:
+                cls_id = int(box.cls[0].item())
+                conf = float(box.conf[0].item())
+                damages.append(model.names[cls_id])
+                confidences.append(round(conf, 2))
 
     os.remove(temp_path)
 
+    if not damages:
+        return {
+            "damage_detected": False,
+            "summary": "No damage detected"
+        }
+
+    unique_damages = list(set(damages))
+    max_conf = max(confidences)
+
+    # Simple severity logic
+    if len(unique_damages) >= 3 or max_conf > 0.85:
+        severity = "High"
+    elif len(unique_damages) == 2 or max_conf > 0.6:
+        severity = "Medium"
+    else:
+        severity = "Low"
+
     return {
-        "filename": file.filename,
-        "content_type": file.content_type,
-        "size_bytes": file_size,
-        "damage_detected": False,
-        "summary": "Upload API is working. Model integration is next."
+        "damage_detected": True,
+        "damages": unique_damages,
+        "confidence": confidences,
+        "severity": severity,
+        "summary": f"Detected {', '.join(unique_damages)} damage. Severity: {severity}"
     }
