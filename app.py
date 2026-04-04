@@ -1,298 +1,249 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash
-import config
-import mysql.connector as connector
+from flask import Flask, render_template, request, send_file
+from ultralytics import YOLO
 from werkzeug.utils import secure_filename
 import os
-from ultralytics import YOLO
-import bcrypt
-from collections import Counter
-from dotenv import load_dotenv
-
-
-load_dotenv()
-
+import cv2
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 
 app = Flask(__name__)
-app.secret_key = os.getenv('SECRET_KEY')
+
+# -----------------------------
+# Paths
+# -----------------------------
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+UPLOAD_DIR = os.path.join(STATIC_DIR, "uploads")
+RESULT_DIR = os.path.join(STATIC_DIR, "results")
+REPORT_DIR = os.path.join(BASE_DIR, "reports")
+MODEL_DIR = os.path.join(BASE_DIR, "models")
+
+PART_MODEL_PATH = os.path.join(MODEL_DIR, "part_model.pt")
+DAMAGE_MODEL_PATH = os.path.join(MODEL_DIR, "damage_model.pt")
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(RESULT_DIR, exist_ok=True)
+os.makedirs(REPORT_DIR, exist_ok=True)
+
+# -----------------------------
+# Load models once
+# -----------------------------
+part_model = YOLO(PART_MODEL_PATH)
+damage_model = YOLO(DAMAGE_MODEL_PATH)
+
+# -----------------------------
+# Helper functions
+# -----------------------------
+def calculate_iou(box1, box2):
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+
+    inter_w = max(0, x2 - x1)
+    inter_h = max(0, y2 - y1)
+    inter_area = inter_w * inter_h
+
+    box1_area = max(0, box1[2] - box1[0]) * max(0, box1[3] - box1[1])
+    box2_area = max(0, box2[2] - box2[0]) * max(0, box2[3] - box2[1])
+
+    union_area = box1_area + box2_area - inter_area
+    if union_area == 0:
+        return 0
+
+    return inter_area / union_area
 
 
-def connect_to_db():
+def map_damage_to_parts(parts, damages):
+    mapped_results = []
+
+    for damage in damages:
+        best_part = None
+        best_iou = 0
+
+        for part in parts:
+            iou = calculate_iou(damage["box"], part["box"])
+            if iou > best_iou:
+                best_iou = iou
+                best_part = part["label"]
+
+        if best_part:
+            mapped_results.append(f'{damage["label"]} on {best_part}')
+        else:
+            mapped_results.append(f'{damage["label"]} detected')
+
+    return mapped_results
+
+
+def generate_pdf(owner_name, car_model, vehicle_no, model_no, mapped_results, input_path, output_path):
+    pdf_path = os.path.join(REPORT_DIR, "damage_report.pdf")
+
+    c = canvas.Canvas(pdf_path, pagesize=A4)
+    width, height = A4
+    y = height - 50
+
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(170, y, "Vehicle Damage Report")
+
+    y -= 40
+    c.setFont("Helvetica", 12)
+    c.drawString(50, y, f"Owner Name: {owner_name}")
+    y -= 20
+    c.drawString(50, y, f"Car Model: {car_model}")
+    y -= 20
+    c.drawString(50, y, f"Vehicle Number: {vehicle_no}")
+    y -= 20
+    c.drawString(50, y, f"Model Number: {model_no}")
+
+    y -= 30
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(50, y, "Detected Damage Summary:")
+    y -= 20
+
+    c.setFont("Helvetica", 12)
+    if mapped_results:
+        for item in mapped_results:
+            c.drawString(70, y, f"- {item}")
+            y -= 18
+            if y < 120:
+                c.showPage()
+                y = height - 50
+                c.setFont("Helvetica", 12)
+    else:
+        c.drawString(70, y, "No damage detected.")
+        y -= 20
+
+    y -= 20
+    if y < 250:
+        c.showPage()
+        y = height - 50
+
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(50, y, "Uploaded Image")
+    c.drawString(300, y, "Detection Result")
+    y -= 190
+
     try:
-        connection = connector.connect(**config.mysql_credentials)
-        return connection
-    except connector.Error as e:
-        print(f"Error connecting to database: {e}")
-        return None
+        uploaded_img = ImageReader(input_path)
+        c.drawImage(uploaded_img, 50, y, width=220, height=160, preserveAspectRatio=True, mask='auto')
+    except Exception:
+        c.drawString(50, y + 80, "Unable to load uploaded image.")
+
+    try:
+        detected_img = ImageReader(output_path)
+        c.drawImage(detected_img, 300, y, width=220, height=160, preserveAspectRatio=True, mask='auto')
+    except Exception:
+        c.drawString(300, y + 80, "Unable to load detected image.")
+
+    c.save()
+    return pdf_path
 
 
-@app.route('/')
+def run_detection(input_path):
+    parts = []
+    damages = []
+
+    # Part detection
+    part_results = part_model.predict(source=input_path, conf=0.25)
+    part_boxes = part_results[0].boxes
+
+    if part_boxes is not None and len(part_boxes) > 0:
+        for box in part_boxes:
+            cls_id = int(box.cls.item())
+            conf = float(box.conf.item())
+            coords = box.xyxy[0].tolist()
+            parts.append({
+                "label": part_results[0].names[cls_id],
+                "confidence": conf,
+                "box": coords
+            })
+
+    # Damage detection
+    damage_results = damage_model.predict(source=input_path, conf=0.25)
+    damage_boxes = damage_results[0].boxes
+
+    if damage_boxes is not None and len(damage_boxes) > 0:
+        for box in damage_boxes:
+            cls_id = int(box.cls.item())
+            conf = float(box.conf.item())
+            coords = box.xyxy[0].tolist()
+            damages.append({
+                "label": damage_results[0].names[cls_id],
+                "confidence": conf,
+                "box": coords
+            })
+
+    # Save plotted damage image
+    output_path = os.path.join(RESULT_DIR, "output.jpg")
+    plotted = damage_results[0].plot()
+    cv2.imwrite(output_path, plotted)
+
+    return parts, damages, output_path
+
+
+# -----------------------------
+# Routes
+# -----------------------------
+@app.route("/", methods=["GET", "POST"])
 def home():
-    return render_template('index.html')
+    if request.method == "POST":
+        owner_name = request.form.get("owner_name", "").strip()
+        car_model = request.form.get("car_model", "").strip()
+        vehicle_no = request.form.get("vehicle_no", "").strip()
+        model_no = request.form.get("model_no", "").strip()
+        file = request.files.get("image")
 
+        if not owner_name or not car_model or not vehicle_no or not model_no:
+            return render_template("index.html", error="Please fill all details.")
 
-@app.route('/signup', methods=['GET', 'POST'])
-def signup():
-    if request.method == 'POST':
-        name = request.form.get('name')
-        password = request.form.get('password')
-        email = request.form.get('email')
-        vehicle_id = request.form.get('vehicleId')
-        contact_number = request.form.get('phoneNumber')
-        address = request.form.get('address')
-        car_brand = request.form.get('carBrand')
-        model = request.form.get('carModel')
-        
-        # print("DATA from form")
-        # print(f"name : {name}")
-        # print(f"email : {email}")
-        # print(f"password : {password}")
-        # print(f"vehicle_id : {vehicle_id}")
-        # print(f"contact_number : {contact_number}")
-        # print(f"address : {address}")
-        # print(f"car_brand : {car_brand}")
-        # print(f"model : {model}")
-
-        if not all([name, password, email, vehicle_id, contact_number, address, car_brand, model]):
-            flash("All fields are required!", "error")
-            return render_template('signup.html')
-
-        hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-
-        connection = connect_to_db()
-        if connection:
-            try:
-                with connection.cursor() as cursor:
-                    query = '''
-                    INSERT INTO user_info (name, password, email, vehicle_id, contact_number, address, car_brand, model)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    '''
-                    cursor.execute(query, (name, hashed_password, email, vehicle_id, contact_number, address, car_brand, model))
-                    connection.commit()
-                flash("Signup successful!", "success")
-                return redirect(url_for('dashboard'))
-            except connector.IntegrityError as e:
-                if 'Duplicate entry' in str(e):
-                    flash("Email already exists. Please use a different email.", "error")
-                else:
-                    flash("An error occurred while signing up. Please try again.", "error")
-            except connector.Error as e:
-                print(f"Error executing query: {e}")
-                flash("An error occurred while signing up. Please try again.", "error")
-        else:
-            flash("Database connection failed. Please try again later.", "error")
-            
-    return render_template('signup.html')
-
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        email = request.form.get('email')
-        password = request.form.get('password')
-        print(f"Email : {email}")
-        print(f"Password : {password}")
-
-        if not email or not password:
-            flash("Email and password are required!", "error")
-            return render_template('login.html')
-
-        connection = connect_to_db()
-        if connection:
-            try:
-                with connection.cursor() as cursor:
-                    query = "SELECT password FROM user_info WHERE email = %s"
-                    cursor.execute(query, (email,))
-                    result = cursor.fetchone()
-                    if result and bcrypt.checkpw(password.encode('utf-8'), result[0].encode('utf-8')):
-                        session['user_email'] = email  # Store user email in session
-                        flash("Login successful!", "success")
-                        return redirect(url_for('dashboard'))
-                    else:
-                        flash("Invalid email or password.", "error")
-            except connector.Error as e:
-                print(f"Error executing query: {e}")
-                flash("An error occurred during login. Please try again.", "error")
-        else:
-            flash("Database connection failed. Please try again later.", "error")
-
-    return render_template('login.html')
-
-
-@app.route('/logout')
-def logout():
-    session.pop('user_email', None)  # Remove user email from session
-    flash("You have been logged out.", "info")
-    
-    return redirect(url_for('login'))
-
-
-# Load YOLO model
-model_path = "D:/Vehicle Damage Detection/models/model weights/best.pt"
-model = YOLO(model_path)
-
-
-@app.route('/dashboard', methods=['GET', 'POST'])
-def dashboard():
-    if request.method == 'POST':
-        file = request.files.get('image')
-        if not file:
-            flash('Please upload an image.', 'error')
-            return render_template('dashboard.html')
+        if not file or file.filename == "":
+            return render_template("index.html", error="Please upload an image.")
 
         filename = secure_filename(file.filename)
-        if not filename.lower().endswith(('.png', '.jpg', '.jpeg')):
-            flash('Invalid file type. Please upload an image.', 'error')
-            return render_template('dashboard.html')
-        
-        # Save the uploaded image
-        image_path = os.path.join('D:/Vehicle Damage Detection/static', 'uploaded_image.jpg')
-        print("File uploaded successfully")
-        
-        file.save(image_path)
-        # print(f"Upload image path : {image_path}")
-        # Make predictions using YOLO
-        result = model(image_path)
-        detected_objects = result[0].boxes
-        class_ids = [box.cls.item() for box in detected_objects]
-        class_counts = Counter(class_ids)
-        # print(f"Class counts : {class_counts}")
-        # Save the image with detections
-        detected_image_path = os.path.join('D:/Vehicle Damage Detection/static', 'detected_image.jpg')
-        detected_image_path = result[0].save(detected_image_path)
-        print(f"Detected image path : {detected_image_path}")
-        # Get the user's email from session
-        user_email = session.get('user_email')
-        print(user_email)
-        if not user_email:
-            flash('You need to log in to get an estimate.', 'error')
-            return redirect(url_for('login'))
+        if not filename.lower().endswith((".png", ".jpg", ".jpeg")):
+            return render_template("index.html", error="Please upload PNG, JPG, or JPEG only.")
 
-        # Fetch part prices from the database
-        part_prices = get_part_prices(user_email, class_counts)
-        # print(f"Part prices : {part_prices}")
-        return render_template('estimate.html', original_image='uploaded_image.jpg', detected_image='detected_image.jpg', part_prices=part_prices)
+        input_path = os.path.join(UPLOAD_DIR, "input.jpg")
+        file.save(input_path)
 
-    return render_template('dashboard.html')
+        parts, damages, output_path = run_detection(input_path)
+        mapped_results = map_damage_to_parts(parts, damages)
 
+        generate_pdf(
+            owner_name,
+            car_model,
+            vehicle_no,
+            model_no,
+            mapped_results,
+            input_path,
+            output_path
+        )
 
-def get_part_prices(email, class_counts):
-    connection = connect_to_db()
-    if connection:
-        try:
-            with connection.cursor(dictionary=True) as cursor:
-                # Get user's car brand and model
-                cursor.execute("SELECT car_brand, model FROM user_info WHERE email = %s", (email,))
-                user_data = cursor.fetchone()
-                if not user_data:
-                    print("User not found")
-                    return {}
+        return render_template(
+            "index.html",
+            success="Detection completed successfully.",
+            owner_name=owner_name,
+            car_model=car_model,
+            vehicle_no=vehicle_no,
+            model_no=model_no,
+            input_image="uploads/input.jpg",
+            output_image="results/output.jpg",
+            detected_parts=[p["label"] for p in parts],
+            detected_damages=[d["label"] for d in damages],
+            mapped_results=mapped_results,
+            pdf_ready=True
+        )
 
-                car_brand = user_data['car_brand']
-                car_model = user_data['model']
-
-                # Fetch part prices
-                prices = {}
-                for class_id, count in class_counts.items():
-                    part_name = get_part_name_from_id(class_id)
-                    # print(f"Parts name: {part_name}")
-                    if part_name:
-                        cursor.execute(
-                            "SELECT price FROM car_models WHERE brand = %s AND model = %s AND part = %s",
-                            (car_brand, car_model, part_name)
-                        )
-                        price_data = cursor.fetchone()
-                        # print(f"Price data : {price_data}")
-                        if price_data:
-                            price_per_part = price_data['price']
-                            total_price = price_per_part * count
-                            prices[part_name] = {'count': count, 'price': price_per_part, 'total': total_price}
-                # print(f"Prices : {prices}")
-                return prices
-        except connector.Error as e:
-            print(f"Error executing query: {e}")
-            return {}
-    print("Connection failed")
-    return {}
+    return render_template("index.html")
 
 
-def get_part_name_from_id(class_id):
-    class_names = ['Bonnet', 'Bumper', 'Dickey', 'Door', 'Fender', 'Light', 'Windshield']
-    if 0 <= class_id < len(class_names):
-        return class_names[int(class_id)]
-    return None
+@app.route("/download-pdf")
+def download_pdf():
+    pdf_path = os.path.join(REPORT_DIR, "damage_report.pdf")
+    return send_file(pdf_path, as_attachment=True)
 
 
-@app.route('/view_profile')
-def view_profile():
-    if 'user_email' not in session:
-        flash('You need to login to view your profile.', 'error')
-        return redirect(url_for('login'))
-
-    connection = connect_to_db()
-    if connection:
-        try:
-            with connection.cursor(dictionary=True) as cursor:
-                # Fetch current user information
-                cursor.execute("SELECT * FROM user_info WHERE email = %s", (session['user_email'],))
-                user_info = cursor.fetchone()
-                if not user_info:
-                    flash('User not found.', 'error')
-                    return redirect(url_for('dashboard'))
-                return render_template('view_profile.html', user_info=user_info)
-        except connector.Error as e:
-            print(f"Error executing query: {e}")
-            flash("An error occurred while fetching your profile. Please try again.", "error")
-    else:
-        flash("Database connection failed. Please try again later.", "error")
-
-    return redirect(url_for('dashboard'))
-
-
-@app.route('/edit_profile', methods=['GET', 'POST'])
-def edit_profile():
-    if 'user_email' not in session:
-        flash('You need to login to edit your profile.', 'error')
-        return redirect(url_for('login'))
-
-    connection = connect_to_db()
-    if connection:
-        try:
-            with connection.cursor(dictionary=True) as cursor:
-                if request.method == 'POST':
-                    # Update user information
-                    query = '''
-                    UPDATE user_info
-                    SET name = %s, email = %s, vehicle_id = %s, contact_number = %s, 
-                        address = %s, car_brand = %s, model = %s
-                    WHERE email = %s
-                    '''
-                    cursor.execute(query, (
-                        request.form['name'],
-                        request.form['email'],
-                        request.form['vehicleId'],
-                        request.form['phoneNumber'],
-                        request.form['address'],
-                        request.form['carBrand'],
-                        request.form['carModel'],
-                        session['user_email']
-                    ))
-                    connection.commit()
-                    flash('Profile updated successfully!', 'success')
-                    session['user_email'] = request.form['email']  # Update session if email changed
-                    return redirect(url_for('dashboard'))
-
-                # Fetch current user information
-                cursor.execute("SELECT * FROM user_info WHERE email = %s", (session['user_email'],))
-                user_info = cursor.fetchone()
-                return render_template('edit_profile.html', user_info=user_info)
-
-        except connector.Error as e:
-            print(f"Error executing query: {e}")
-            flash("An error occurred while updating your profile. Please try again.", "error")
-    else:
-        flash("Database connection failed. Please try again later.", "error")
-
-    return redirect(url_for('dashboard'))
-
-if __name__ == '__main__':
-    app.run(debug=True)
+if __name__ == "__main__":
+    app.run(debug=True, use_reloader=False)

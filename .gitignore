@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+
+# Models (IMPORTANT)
+*.pt
+models/
+
+# Dataset (IMPORTANT)
+roboflow dataset/
+
+# Reports
+reports/
+
+# Environment
+venv/
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
