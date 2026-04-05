@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: vehicle-damage-assessment
+    env: python
+    region: ohio
+    plan: free # Change to 'starter' if memory issues occur
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: PYTHON_VERSION
+        value: 3.11.9
